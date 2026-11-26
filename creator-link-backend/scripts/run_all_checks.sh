@@ -43,3 +43,6 @@ python3 scripts/verify_restart_concurrency.py
 echo
 echo "Limited-edition issues restart/concurrency check:"
 python3 scripts/verify_issues_restart_concurrency.py
+echo
+echo "Royalty sales/refunds/settlements restart/concurrency check:"
+python3 scripts/verify_royalties_restart_concurrency.py

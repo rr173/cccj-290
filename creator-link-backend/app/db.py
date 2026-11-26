@@ -258,6 +258,144 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     created_at REAL NOT NULL,
     UNIQUE(scope, actor_id, key)
 );
+
+-- ---------------------------------------------------------------------------
+-- Owner-scoped royalty ledger and finance settlement orders
+--
+-- Sales snapshot the collaborator and basis points in effect at sale time.
+-- Refund allocations are recomputed cumulatively against that snapshot, so a
+-- later collaborator/rate change never rewrites old sales.  Settlement items
+-- are immutable money instructions; only their finance confirmation state
+-- changes.  The partial unique index is the final guard against two pending
+-- transfers for the same owner/payee account.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS issue_royalty_shares (
+    issue_id INTEGER PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    creator_account_id INTEGER NOT NULL REFERENCES accounts(id),
+    basis_points INTEGER NOT NULL CHECK (basis_points BETWEEN 0 AND 10000),
+    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_royalty_shares_owner
+    ON issue_royalty_shares(owner_id);
+CREATE INDEX IF NOT EXISTS idx_royalty_shares_creator
+    ON issue_royalty_shares(creator_account_id);
+
+CREATE TABLE IF NOT EXISTS issue_royalty_share_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    creator_account_id INTEGER NOT NULL REFERENCES accounts(id),
+    basis_points INTEGER NOT NULL CHECK (basis_points BETWEEN 0 AND 10000),
+    version INTEGER NOT NULL,
+    changed_by INTEGER NOT NULL REFERENCES accounts(id),
+    created_at REAL NOT NULL,
+    UNIQUE(issue_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS royalty_sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    external_order_no TEXT NOT NULL,
+    gross_amount INTEGER NOT NULL CHECK (gross_amount > 0),
+    memo TEXT,
+    creator_account_id INTEGER NOT NULL REFERENCES accounts(id),
+    basis_points INTEGER NOT NULL CHECK (basis_points BETWEEN 0 AND 10000),
+    creator_gross_amount INTEGER NOT NULL CHECK (creator_gross_amount >= 0),
+    owner_gross_amount INTEGER NOT NULL CHECK (owner_gross_amount >= 0),
+    refunded_amount INTEGER NOT NULL DEFAULT 0 CHECK (refunded_amount >= 0),
+    creator_refunded_amount INTEGER NOT NULL DEFAULT 0
+        CHECK (creator_refunded_amount >= 0),
+    owner_refunded_amount INTEGER NOT NULL DEFAULT 0
+        CHECK (owner_refunded_amount >= 0),
+    request_fingerprint TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    UNIQUE(owner_id, external_order_no),
+    CHECK (refunded_amount <= gross_amount),
+    CHECK (creator_refunded_amount <= creator_gross_amount),
+    CHECK (owner_refunded_amount <= owner_gross_amount),
+    CHECK (creator_refunded_amount + owner_refunded_amount = refunded_amount),
+    CHECK (creator_gross_amount + owner_gross_amount = gross_amount)
+);
+CREATE INDEX IF NOT EXISTS idx_royalty_sales_owner_issue
+    ON royalty_sales(owner_id, issue_id, id);
+CREATE INDEX IF NOT EXISTS idx_royalty_sales_creator
+    ON royalty_sales(creator_account_id);
+
+CREATE TABLE IF NOT EXISTS royalty_refunds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    sale_id INTEGER NOT NULL REFERENCES royalty_sales(id),
+    external_refund_no TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    creator_deduction INTEGER NOT NULL CHECK (creator_deduction >= 0),
+    owner_deduction INTEGER NOT NULL CHECK (owner_deduction >= 0),
+    reason TEXT,
+    request_fingerprint TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    UNIQUE(owner_id, external_refund_no),
+    CHECK (creator_deduction + owner_deduction = amount)
+);
+CREATE INDEX IF NOT EXISTS idx_royalty_refunds_sale
+    ON royalty_refunds(sale_id, id);
+CREATE INDEX IF NOT EXISTS idx_royalty_refunds_owner_issue
+    ON royalty_refunds(owner_id, issue_id, id);
+
+CREATE TABLE IF NOT EXISTS royalty_settlements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    request_id TEXT NOT NULL,
+    note TEXT,
+    total_amount INTEGER NOT NULL CHECK (total_amount > 0),
+    item_count INTEGER NOT NULL CHECK (item_count > 0),
+    created_at REAL NOT NULL,
+    UNIQUE(owner_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_royalty_settlements_owner
+    ON royalty_settlements(owner_id, id);
+
+CREATE TABLE IF NOT EXISTS royalty_settlement_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    request_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('issued', 'no_payable')),
+    settlement_id INTEGER REFERENCES royalty_settlements(id),
+    created_at REAL NOT NULL,
+    UNIQUE(owner_id, request_id)
+);
+
+CREATE TABLE IF NOT EXISTS royalty_transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    settlement_id INTEGER NOT NULL
+        REFERENCES royalty_settlements(id) ON DELETE CASCADE,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    payee_account_id INTEGER NOT NULL REFERENCES accounts(id),
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    earned_amount_snapshot INTEGER NOT NULL,
+    paid_amount_snapshot INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'paid', 'failed')),
+    result_status TEXT CHECK (result_status IN ('success', 'failed')),
+    finance_reference TEXT,
+    result_note TEXT,
+    confirmation_key TEXT,
+    created_at REAL NOT NULL,
+    confirmed_at REAL,
+    UNIQUE(settlement_id, payee_account_id),
+    UNIQUE(owner_id, confirmation_key)
+);
+-- At most one outstanding instruction for one payee in one owner ledger.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_royalty_pending_transfer_per_account
+    ON royalty_transfers(owner_id, payee_account_id)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_royalty_transfers_owner_payee
+    ON royalty_transfers(owner_id, payee_account_id, id);
 """
 
 

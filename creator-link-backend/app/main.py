@@ -29,6 +29,7 @@ from .db import get_db, init_db, read_transaction, write_transaction
 from .deps import get_current_account
 from .errors import ApiError, error_body
 from .issues import router as issues_router
+from .royalties import router as royalties_router
 from .schemas import (
     CredentialsIn,
     CurationCreateIn,
@@ -85,6 +86,7 @@ app.add_middleware(
 )
 
 app.include_router(issues_router)
+app.include_router(royalties_router)
 
 
 @app.exception_handler(ApiError)

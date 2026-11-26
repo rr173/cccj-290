@@ -12,6 +12,7 @@ Python + FastAPI + SQLite 的本地演示/可运行服务。账号使用服务�
 - 项目修改历史只记录实际 Bearer 会话账号，并保留当时的 `owner_id` 与图版本，可区分“谁通过共享改了谁的项目”。
 - 邀请确认、重复确认、并发删边、项目写入与解除关联竞争都由 SQLite 事务和唯一约束保护。
 - **限量刊期**：所有者把某条已有修订发布为不可变快照并设总名额，经渠道树划拨、发邀、领取；名额、到期、停用在并发与重启后一致。
+- **版税台账与结算单**：刊期所有者按外部单号登记销售/退款，销售时快照分成作者与基点；所有刊期按收款人合并出结算单，支持逐笔财务成功/失败确认、幂等重放、并发防超退/防重付和重启核对。
 - 提供双会话脚本、三账号链路脚本、限量刊期脚本，以及真实 uvicorn 重启 + HTTP 并发校验脚本。
 
 ---
@@ -115,6 +116,16 @@ python3 -m pytest -q
 | POST | `/issues/invitations/{id}/accept` | 被邀请读者领取；重复接受返回原结果 |
 | GET | `/me/issues` | 读者列出自己已领刊期 |
 | GET | `/issues/{id}/read` | 读者读取已领刊期（发行时的标题与正文） |
+| PUT/POST | `/issues/{id}/royalty-share` | 原刊期所有者指定/更换分成作者和基点比例 |
+| GET/PUT | `/issues/{id}/royalty-share` | 查看当前分成设置与变更历史 |
+| POST/GET | `/issues/{id}/sales` | 登记/列出外部销售款（正整数分） |
+| GET | `/issues/{id}/sales/{external_order_no}` | 核对一笔原销售及其全部退款 |
+| POST | `/issues/{id}/sales/{ref}/refunds` 或 `/royalties/refunds` | 凭独立外部退款单号登记分次退款 |
+| GET | `/royalties/sales` / `/royalties/refunds` | 所有者跨刊期核对销售和退款 |
+| GET | `/royalties/balances` | 按收款账号查看应得、已付、待确认、净余额 |
+| POST/GET | `/royalties/settlements` | 用 `request_id` 幂等出单/列出历次结算单 |
+| GET | `/royalties/settlements/{id}` | 查看结算单及全部汇款项/财务结果 |
+| POST | `/royalties/transfers/{item_id}/result` | 逐项登记财务成功/失败结果 |
 
 ---
 
@@ -420,6 +431,169 @@ curl -sS -X POST http://127.0.0.1:8000/issues/$ISSUE_ID/channels/$CHANNEL_ID/dis
 | 409 | `MULTIPLE_SOURCE_CHANNELS` / `NO_USABLE_CHANNEL` | 不指定渠道时管理人有多/无可用渠道 |
 | 410 | `ISSUE_INVITATION_EXPIRED` | 领取截止已过，名额已释放 |
 
+版税台账额外错误码：
+
+| HTTP | `error.code` | 触发场景 |
+|---:|---|---|
+| 403 | `NOT_ISSUE_OWNER` / `ROYALTY_ACCESS_DENIED` | 非原刊期/台账所有者访问销售、结算单或确认汇款 |
+| 404 | `SALE_NOT_FOUND` / `SETTLEMENT_NOT_FOUND` / `TRANSFER_NOT_FOUND` | 所有者账内找不到对应销售、结算单或汇款项 |
+| 409 | `ROYALTY_SHARE_REQUIRED` | 未指定分成作者和基点就登记销售 |
+| 409 | `REFUND_EXCEEDS_SALE_AMOUNT` | 累计退款超过原销售实收额 |
+| 409 | `NO_PAYABLE_BALANCES` | 没有“无 pending 且净余额为正”的账号，因此未出单 |
+| 409 | `TRANSFER_RESULT_IMMUTABLE` | 已确认成功/失败后尝试改报相反结果 |
+| 409 | `IDEMPOTENCY_CONFLICT` | 销售单号、退款单号或出单请求 ID 已用于不同参数 |
+
+---
+
+## 5A. 销售款、退款与版税结算单
+
+这套接口只记外部渠道已经发生的钱并生成财务汇款单，**不接支付平台**，也不修改刊期名额、邀请或阅读权益。所有金额都是整数**分**；比例是 `0..10000` 的整数基点（`10000 = 100%`）。
+
+只有刊期的原所有者可以调用刊期销售/分成接口和自己名下的结算接口。项目关联账号、渠道管理人、渠道发行账号和读者均不继承该权限；分成作者本人也不能查看或修改所有者台账。
+
+### 5A.1 分成作者与比例
+
+登记某期刊的第一笔销售前，先指定一位**已注册账号**且与所有者不同的分成作者：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8000/issues/$ISSUE_ID/royalty-share \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"creator_username":"alice","basis_points":3000}'
+```
+
+也支持 `creator_account_id`、`author_username`、`share_bps` 等别名字段。以后换人或改比例仍调用同一接口；历史设置保存在 `issue_royalty_share_history`，但**只有之后的新销售使用新设置**。每笔销售都会快照当时的作者账号、基点和两边金额。
+
+### 5A.2 销售与分次退款
+
+按外部渠道单号登记实收金额：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/issues/$ISSUE_ID/sales \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_order_no":"EXT-ORDER-1001","amount":1000}'
+```
+
+分成计算为：
+
+```text
+作者应得 = floor(实收金额 × 销售时基点 / 10000)
+所有者应得 = 实收金额 - 作者应得
+```
+
+同一所有者账下，`external_order_no` 唯一。相同请求重送返回原销售（`idempotent_replay: true`）；同一单号改金额、刊期等参数返回 `409 IDEMPOTENCY_CONFLICT`。
+
+退款使用独立的外部退款单号，并指向原销售；可分多次：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/royalties/refunds \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "external_refund_no":"EXT-REFUND-1001-1",
+    "sale_external_order_no":"EXT-ORDER-1001",
+    "amount":120
+  }'
+```
+
+累计退款不得超过原销售实收额，否则返回 `409 REFUND_EXCEEDS_SALE_AMOUNT`，不会写入退款。退款单号在同一所有者账下唯一，重送返回原退款，改参数报冲突。
+
+退款不是简单按退款本金乘比例，而是在每次退款后重算：
+
+```text
+退款后作者累计应得 = floor((原实收 - 累计退款) × 原基点 / 10000)
+本笔作者冲减 = 新累计作者冲减额 - 此前累计作者冲减额
+本笔所有者冲减 = 退款金额 - 本笔作者冲减
+```
+
+因此向下取整产生的分币差额也有明确归属；每笔退款响应和销售详情都给出 `creator_deduction`/`owner_deduction`，可逐笔核对。
+
+核对入口：
+
+- `GET /issues/{issue_id}/sales`：该刊期原销售及嵌套退款；
+- `GET /issues/{issue_id}/sales/{external_order_no}`：单笔原销售及全部退款；
+- `GET /issues/{issue_id}/royalties`：该刊期分成设置、销售、退款和金额合计；
+- `GET /royalties/sales`：当前所有者全部刊期的销售，可加 `?issue_id=`；
+- `GET /royalties/refunds`：当前所有者全部退款。
+
+### 5A.3 按收款账号合并余额
+
+同一所有者名下所有刊期合并，并按收款账号（所有者本人的残留份额也作为一个收款账号，以及各销售快照中的分成作者账号）计算：
+
+```text
+应得额 earned_amount = 销售分成 - 退款累计冲减
+净余额 net_balance = 应得额 - 已付金额 paid_amount - 待确认金额 pending_amount
+```
+
+查询：
+
+```bash
+curl -sS http://127.0.0.1:8000/royalties/balances \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+```
+
+不同所有者的账完全隔离，不会相互抵销。若已付后发生退款，`net_balance` 可以为负；同一收款账号之后的新销售收入会先补足该负数，剩余正净额才可再次出单。
+
+### 5A.4 出结算单与财务结果确认
+
+用客户端生成的 `request_id`（也支持 body 字段 `idempotency_key` 或 `Idempotency-Key` 请求头）出单：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/royalties/settlements \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"payout-run-2026-11-30-1"}'
+```
+
+服务在一个写事务内为每个同时满足以下条件的账号创建一笔全额汇款：
+
+1. 当前没有 `pending` 汇款；
+2. `net_balance > 0`。
+
+没有可付账号时返回 `409 NO_PAYABLE_BALANCES`，不创建结算单或汇款项。同一 `request_id` 重送返回原结算单；同 ID 改其他参数返回 `409 IDEMPOTENCY_CONFLICT`。数据库还有 `(owner_id, request_id)` 唯一约束和“每个所有者+收款账号至多一笔 pending”的部分唯一索引，防止并发重复派付。
+
+汇款项一旦生成，`amount` 和 `payee` 不再改变。之后仍可登记新销售/退款；退款不会修改已生成的汇款项，只改变当前应得额和净余额。
+
+财务可在一张单内逐项确认，不必整单同时处理：
+
+```bash
+# 财务汇款成功：计为已付
+curl -sS -X POST \
+  http://127.0.0.1:8000/royalties/transfers/$TRANSFER_ITEM_ID/result \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"result":"success","finance_reference":"bank-txn-7788"}'
+
+# 财务汇款失败：解除待确认占用
+curl -sS -X POST \
+  http://127.0.0.1:8000/royalties/transfers/$TRANSFER_ITEM_ID/result \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"result":"failed","note":"account name mismatch"}'
+```
+
+相同结果重送只返回原汇款项（`idempotent_replay: true`），不会重复记为已付；成功后改报失败、或失败后改报成功均返回 `409 TRANSFER_RESULT_IMMUTABLE`。失败项释放 `pending_amount`，之后能否再出单以当时的净余额为准。
+
+查询历次结算单及结果：
+
+```bash
+curl -sS http://127.0.0.1:8000/royalties/settlements \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+curl -sS http://127.0.0.1:8000/royalties/settlements/$SETTLEMENT_ID \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+```
+
+为兼容不同客户端命名，另提供 `/royalty/...`、`/settlements...`、`/royalty-settlements...`、`/royalties/items/{id}/result`、`/payouts/{id}/result` 以及 `.../success`、`.../fail` 等路径别名；响应同时包含 `items` 与 `transfers`、`net_balance` 与 `balance`、`author_amount` 与 `creator_amount` 等同义字段。
+
+### 5A.5 并发、重启与回归校验
+
+- 销售、退款、出单、确认全部使用 `BEGIN IMMEDIATE` 写事务；SQLite 写事务串行化“读余额/累计退款 → 校验 → 写明细”。
+- 自然唯一约束兜底：`UNIQUE(owner_id, external_order_no)`、`UNIQUE(owner_id, external_refund_no)`、`UNIQUE(owner_id, request_id)`，以及每账号至多一笔 pending 汇款的部分唯一索引。
+- 所有台账、结算单、汇款项和财务结果均落 SQLite；重启后可继续确认、出单和逐笔核对。
+- API 回归测试：`python3 -m pytest tests/test_royalties.py -q`。
+- 真实 uvicorn 重启 + HTTP 并发校验：`python3 scripts/verify_royalties_restart_concurrency.py`。
+
 ---
 
 ## 6. 错误响应说明
@@ -554,6 +728,7 @@ creator-link-backend/
 ├── app/
 │   ├── main.py          # FastAPI 路由、事务内授权、curation
 │   ├── issues.py        # 限量刊期：快照、渠道树、名额、邀请、领取
+│   ├── royalties.py     # 销售/退款、分成快照、余额、结算单与汇款确认
 │   ├── deps.py          # 共享的 Bearer 会话依赖
 │   ├── db.py            # SQLite schema、WAL/busy_timeout、事务上下文
 │   ├── schemas.py       # 请求模型；不接收 owner_id 更新
@@ -566,10 +741,12 @@ creator-link-backend/
 │   ├── demo_issues.py
 │   ├── verify_restart_concurrency.py
 │   ├── verify_issues_restart_concurrency.py
+│   ├── verify_royalties_restart_concurrency.py
 │   └── run_all_checks.sh
 ├── tests/
 │   ├── test_workbench.py
-│   └── test_issues.py
+│   ├── test_issues.py
+│   └── test_royalties.py
 ├── requirements.txt
 └── README.md
 ```

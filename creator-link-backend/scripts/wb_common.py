@@ -116,6 +116,9 @@ class Client:
     def post(self, path: str, **kwargs: Any):
         return self.request("POST", path, **kwargs)
 
+    def put(self, path: str, **kwargs: Any):
+        return self.request("PUT", path, **kwargs)
+
     def patch(self, path: str, **kwargs: Any):
         return self.request("PATCH", path, **kwargs)
 
