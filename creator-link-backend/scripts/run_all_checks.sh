@@ -40,3 +40,6 @@ python3 scripts/demo_three_chain.py "$BASE_URL"
 echo
 echo "Both demos passed. Restart/concurrency check:"
 python3 scripts/verify_restart_concurrency.py
+echo
+echo "Limited-edition issues restart/concurrency check:"
+python3 scripts/verify_issues_restart_concurrency.py

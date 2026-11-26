@@ -159,6 +159,105 @@ CREATE TABLE IF NOT EXISTS project_content_edits (
     created_at REAL NOT NULL,
     UNIQUE(project_id, revision)
 );
+
+-- ---------------------------------------------------------------------------
+-- Limited-edition issues
+--
+-- An issue is an immutable snapshot of one project revision plus a quota that
+-- is distributed through a tree of channels.  ``issue_channels`` keeps one
+-- mutable ``available`` counter per channel; moving quota between channels
+-- never changes the sum of ``available``.  Held quota lives in pending
+-- invitations, consumed quota lives in entitlements.  The invariant
+--
+--   total_quota == SUM(channels.available)
+--                  + COUNT(pending invitations)
+--                  + COUNT(accepted invitations)
+--
+-- therefore holds at every committed point (see issue_service for settlement).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    owner_id INTEGER NOT NULL REFERENCES accounts(id),
+    source_revision INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    total_quota INTEGER NOT NULL CHECK (total_quota > 0),
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_issues_owner ON issues(owner_id, id);
+
+CREATE TABLE IF NOT EXISTS issue_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    parent_id INTEGER REFERENCES issue_channels(id),
+    manager_id INTEGER NOT NULL REFERENCES accounts(id),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled')),
+    granted INTEGER NOT NULL DEFAULT 0,
+    available INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    disabled_at REAL,
+    disabled_by INTEGER REFERENCES accounts(id),
+    CHECK (granted >= 0),
+    CHECK (available >= 0)
+);
+-- Exactly one root (owner-operated) channel per issue.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_root
+    ON issue_channels(issue_id) WHERE parent_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_channels_issue ON issue_channels(issue_id, id);
+CREATE INDEX IF NOT EXISTS idx_channels_parent ON issue_channels(parent_id, id);
+CREATE INDEX IF NOT EXISTS idx_channels_manager ON issue_channels(manager_id, id);
+
+CREATE TABLE IF NOT EXISTS issue_invitations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    channel_id INTEGER NOT NULL REFERENCES issue_channels(id),
+    reader_id INTEGER NOT NULL REFERENCES accounts(id),
+    invited_by INTEGER NOT NULL REFERENCES accounts(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'expired')),
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    accepted_at REAL,
+    settled_at REAL
+);
+-- A reader holds at most one *live* invitation per issue, regardless of which
+-- channel issued it.  Expired rows are settled out of 'pending' first, so a
+-- fresh invitation may reuse the slot afterwards.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_live_issue_invitation
+    ON issue_invitations(issue_id, reader_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_inv_reader ON issue_invitations(reader_id, id);
+CREATE INDEX IF NOT EXISTS idx_inv_issue ON issue_invitations(issue_id, id);
+CREATE INDEX IF NOT EXISTS idx_inv_channel ON issue_invitations(channel_id, id);
+CREATE INDEX IF NOT EXISTS idx_inv_pending_expiry
+    ON issue_invitations(status, expires_at) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS issue_entitlements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    reader_id INTEGER NOT NULL REFERENCES accounts(id),
+    channel_id INTEGER NOT NULL REFERENCES issue_channels(id),
+    invitation_id INTEGER NOT NULL UNIQUE REFERENCES issue_invitations(id),
+    accepted_at REAL NOT NULL,
+    UNIQUE(issue_id, reader_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ent_reader ON issue_entitlements(reader_id, id);
+
+-- Replay cache for at-least-once client retries.  A record is written in the
+-- same transaction as the effect it describes, so a failure leaves neither.
+CREATE TABLE IF NOT EXISTS idempotency_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    actor_id INTEGER NOT NULL REFERENCES accounts(id),
+    key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(scope, actor_id, key)
+);
 """
 
 

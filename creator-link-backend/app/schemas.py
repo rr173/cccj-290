@@ -52,3 +52,36 @@ class ProjectUpdateIn(BaseModel):
         if self.title is None and self.content is None:
             raise ValueError("at least one of title or content is required")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Limited-edition issues
+# ---------------------------------------------------------------------------
+
+
+class IssueCreateIn(BaseModel):
+    """Snapshot one existing revision with a fixed total quota."""
+
+    source_revision: int = Field(ge=1)
+    total_quota: int = Field(ge=1, le=1_000_000)
+    # Required so a retried create never mints a second issue.
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ChannelAllocateIn(BaseModel):
+    """Move quota from the actor's channel to a new managed child channel."""
+
+    manager_username: str = Field(min_length=3, max_length=32)
+    quota: int = Field(ge=1, le=1_000_000)
+    # Omit only when the actor manages exactly one usable source channel.
+    parent_channel_id: int | None = None
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class IssueInvitationCreateIn(BaseModel):
+    reader_username: str = Field(min_length=3, max_length=32)
+    # Claim deadline, relative to now.  After it passes the seat is released.
+    ttl_seconds: int = Field(default=7 * 24 * 3600, ge=1, le=365 * 24 * 3600)
+    # Optional on the issue-level endpoint; the channel-scoped endpoint fixes it.
+    channel_id: int | None = None
+    idempotency_key: str | None = Field(default=None, max_length=200)

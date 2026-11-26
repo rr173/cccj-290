@@ -11,7 +11,8 @@ Python + FastAPI + SQLite 的本地演示/可运行服务。账号使用服务�
 - 删除一条边后，下一次请求立即按新图鉴权；若仍有替代路径，访问不丢失。
 - 项目修改历史只记录实际 Bearer 会话账号，并保留当时的 `owner_id` 与图版本，可区分“谁通过共享改了谁的项目”。
 - 邀请确认、重复确认、并发删边、项目写入与解除关联竞争都由 SQLite 事务和唯一约束保护。
-- 提供双会话脚本、三账号链路脚本，以及真实 uvicorn 重启 + HTTP 并发校验脚本。
+- **限量刊期**：所有者把某条已有修订发布为不可变快照并设总名额，经渠道树划拨、发邀、领取；名额、到期、停用在并发与重启后一致。
+- 提供双会话脚本、三账号链路脚本、限量刊期脚本，以及真实 uvicorn 重启 + HTTP 并发校验脚本。
 
 ---
 
@@ -54,9 +55,12 @@ python3 scripts/demo_two_sessions.py http://127.0.0.1:8000
 
 # 三账号 A-B-C：链式访问、断边分量、替代路径
 python3 scripts/demo_three_chain.py http://127.0.0.1:8000
+
+# 限量刊期：快照、划拨、邀请、领取、读者无项目权限、停用渠道
+python3 scripts/demo_issues.py http://127.0.0.1:8000
 ```
 
-或者让脚本自己启动临时服务并运行两个演示 + 重启/并发校验：
+或者让脚本自己启动临时服务并运行演示 + 重启/并发校验：
 
 ```bash
 bash scripts/run_all_checks.sh
@@ -65,7 +69,11 @@ bash scripts/run_all_checks.sh
 单独运行重启与并发一致性验证：
 
 ```bash
+# 账号关联图：共享写入与删边竞争、离线图/历史不变式
 python3 scripts/verify_restart_concurrency.py
+
+# 限量刊期：并发划拨/发邀/领取、真实 uvicorn 重启、到期惰性结算
+python3 scripts/verify_issues_restart_concurrency.py
 ```
 
 运行单元/API 测试：
@@ -94,6 +102,19 @@ python3 -m pytest -q
 | GET | `/projects/{id}` | 读取单个项目；拿到 ID 也必须通过图鉴权 |
 | PATCH | `/projects/{id}` | 修改标题/内容；可选用整数 `If-Match` 做乐观锁 |
 | GET | `/projects/{id}/history` | 查看只增历史、实际操作者、owner、图版本 |
+| POST | `/projects/{id}/issues` | 所有者把某条已有修订发布为限量刊期（快照 + 总名额） |
+| GET | `/projects/{id}/issues` | 所有者列出该项目所有刊期及名额概况 |
+| GET | `/issues/{id}` | 所有者/管理人查看刊期信息与名额概况 |
+| GET | `/issues/{id}/channels` | 所有者看全部渠道及余量；管理人只看自己管理的渠道 |
+| POST | `/issues/{id}/channels` | 把可用名额划给指定管理账号，生成新下级渠道 |
+| POST | `/issues/{id}/channels/{cid}/disable` | 停用渠道（所有者任意；管理人仅直接下级），覆盖整条下游 |
+| POST | `/issues/{id}/invitations` | 从自己有权限的渠道向读者发邀请（占一个名额） |
+| POST | `/issues/{id}/channels/{cid}/invitations` | 指定渠道发邀请 |
+| GET | `/issues/{id}/channels/{cid}/invitations` | 渠道管理人/所有者列出该渠道邀请 |
+| GET | `/me/issue-invitations` | 读者查看自己的邀请与已领权益 |
+| POST | `/issues/invitations/{id}/accept` | 被邀请读者领取；重复接受返回原结果 |
+| GET | `/me/issues` | 读者列出自己已领刊期 |
+| GET | `/issues/{id}/read` | 读者读取已领刊期（发行时的标题与正文） |
 
 ---
 
@@ -285,7 +306,123 @@ Alice -- Bob
 
 ---
 
-## 5. 错误响应说明
+## 5. 限量刊期（Limited-edition issues）
+
+工作台定稿可以发布为**限量刊期**交给合作渠道发行。刊期是一份**不可变快照**：发布时复制所选项目修订的 `title` 与 `content`，之后工作台继续改稿、改标题都不会影响已发布刊期（`issues` 表独立存储标题/正文，读取接口只读这份快照）。
+
+### 5.1 名额与渠道树
+
+- 每个刊期属于项目所有者，只有一个隐藏的**根渠道**，其 `available` 即所有者**未划拨**的名额。
+- 所有者可把额度划给某个账号，每次划拨都**新建**一个渠道（同一账号划两次会得到两个渠道，旧渠道与其邀请不受影响）。
+- 渠道管理人可继续把自己的可用额度划给下级账号，或从中发邀请。
+- 划拨是**移动**：父渠道 `available` 立即减少，子渠道增加；同一份额度不会同时在两级可用。
+- 核心不变式，在任何已提交状态都成立：
+
+  ```text
+  total_quota == Σ channels.available + 待领取邀请数 + 已领取权益数
+  ```
+
+### 5.2 邀请与领取
+
+- 邀请**指定读者账号**并带**领取截止时间**，发出即从渠道扣 1 个名额（held）。
+- 只有被指定的读者账号能领取；其他账号 `403 NOT_INVITED_READER`。
+- 接受后转为永久**权益**（entitlement），可以一直读取该刊期；截止前未接受则邀请到期，名额释放。
+- 同一读者在同一刊期**最多**一份未过期的待领邀请（无论来自哪个渠道）或一份已领权益。跨渠道重复邀请同一读者会复用原邀请，不占新名额、不延长截止时间。
+- 重复接受返回原领取结果（`idempotent_replay: true`，同一 `entitlement`）。
+- 读者只用自己的现有账号领取，**不需要**关联创作者账号；领取后**不会**获得项目、历史或校订的任何访问权。
+
+### 5.3 停用渠道
+
+- 所有者可停用任一渠道；管理人**只能**停用自己直接划出的下级渠道。
+- 停用覆盖**整条下游分支**：其中的新划拨、新邀请立即被拒。
+- 被停用分支里仍**空闲**的名额退还给该分支的**直接上级**。
+- 已发出的有效邀请仍能领取，已领权益仍可读。
+- 分支里的**待领邀请**之后到期时，名额退给**原渠道沿原路径最近仍有效的上级**（如果整条链都停用，则回到所有者的根渠道）。
+- 停用是幂等的：重复停用返回 `idempotent_replay: true`，不会重复退还名额。
+
+### 5.4 典型调用流程
+
+所有者发布刊期（`idempotency_key` 让重试不重复建刊期）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/projects/$PROJECT_ID/issues \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"source_revision":1,"total_quota":100,"idempotency_key":"edition-2026-11"}'
+```
+
+所有者把 30 个名额划给渠道管理人：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/issues/$ISSUE_ID/channels \
+  -H "Authorization: Bearer $OWNER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"manager_username":"channel_bob","quota":30,"idempotency_key":"alloc-1"}'
+```
+
+渠道管理人从自己的渠道邀请读者（`ttl_seconds` 即领取截止）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/issues/$ISSUE_ID/channels/$CHANNEL_ID/invitations \
+  -H "Authorization: Bearer $MANAGER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"reader_username":"reader_carol","ttl_seconds":86400}'
+```
+
+读者查看并领取，然后阅读：
+
+```bash
+curl -sS http://127.0.0.1:8000/me/issue-invitations -H "Authorization: Bearer $READER_TOKEN"
+curl -sS -X POST http://127.0.0.1:8000/issues/invitations/$INV_ID/accept -H "Authorization: Bearer $READER_TOKEN"
+curl -sS http://127.0.0.1:8000/issues/$ISSUE_ID/read -H "Authorization: Bearer $READER_TOKEN"
+```
+
+所有者查看各渠道余量：
+
+```bash
+curl -sS http://127.0.0.1:8000/issues/$ISSUE_ID/channels -H "Authorization: Bearer $OWNER_TOKEN"
+# {"unallocated_owner_quota":70,"quota":{"free":100,"held_by_invitations":0,"claimed":0},
+#  "channels":[{"id":2,"parent_id":1,"manager":{...},"available":30,...}]}
+```
+
+停用某渠道（整条下游生效，空闲名额回到直接上级）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/issues/$ISSUE_ID/channels/$CHANNEL_ID/disable \
+  -H "Authorization: Bearer $OWNER_TOKEN"
+```
+
+### 5.5 并发、重启与幂等
+
+- 所有名额变动（建刊期、划拨、发邀、停用、接受）都在 `BEGIN IMMEDIATE` 写事务中完成，SQLite 串行化写入，名额计数、held、权益不会出现超额或半成品。
+- `total_quota` 与各渠道 `available` 有非负约束；发邀/划拨不足时返回 `409 INSUFFICIENT_QUOTA`，不产生记录。
+- 到期名额在**每次读写该刊期时**惰性结算（`_settle_expired`），不依赖人工清理；因此截止一过，该名额立即可用。
+- 建刊期、划拨、发邀可带 `idempotency_key`，记录与效果在同一事务写入：重试返回原结果、不重复生效；同一 key 换不同请求体返回 `409 IDEMPOTENCY_CONFLICT`。
+- 自然唯一约束兜底：`UNIQUE(issue_id, reader_id) WHERE status='pending'`（每刊期每读者一条待领邀请）、`UNIQUE(issue_id, reader_id)`（权益）、`UNIQUE(invitation_id)`（一张邀请只产生一份权益）。
+- 全部状态落盘，服务重启后名额、邀请、权益一致；`scripts/verify_issues_restart_concurrency.py` 用真实 uvicorn 重启与并发请求验证。
+
+### 5.6 错误码补充
+
+| HTTP | `error.code` | 触发场景 |
+|---:|---|---|
+| 403 | `NOT_PROJECT_OWNER` | 非项目所有者尝试发布/列出该项目的刊期 |
+| 403 | `ISSUE_ACCESS_DENIED` | 既非所有者又非该刊期渠道管理人 |
+| 403 | `NOT_CHANNEL_MANAGER` | 非渠道管理人尝试从该渠道划拨/发邀 |
+| 403 | `CANNOT_DISABLE_CHANNEL` | 管理人尝试停用非自己直接划出的渠道 |
+| 403 | `NOT_INVITED_READER` | 非被指定读者尝试领取邀请 |
+| 403 | `ISSUE_NOT_CLAIMED` | 未持有权益却尝试读取刊期 |
+| 404 | `ISSUE_NOT_FOUND` / `CHANNEL_NOT_FOUND` / `ISSUE_INVITATION_NOT_FOUND` / `REVISION_NOT_FOUND` | 目标不存在 |
+| 409 | `INSUFFICIENT_QUOTA` | 渠道可用名额不足 |
+| 409 | `CHANNEL_DISABLED` | 从已停用渠道划拨/发邀 |
+| 409 | `ROOT_CHANNEL_NOT_DISABLEABLE` | 尝试停用所有者的根渠道 |
+| 409 | `ALREADY_ENTITLED` | 该读者已持有本刊期权益 |
+| 409 | `IDEMPOTENCY_CONFLICT` | 同一幂等 key 复用于不同请求体 |
+| 409 | `MULTIPLE_SOURCE_CHANNELS` / `NO_USABLE_CHANNEL` | 不指定渠道时管理人有多/无可用渠道 |
+| 410 | `ISSUE_INVITATION_EXPIRED` | 领取截止已过，名额已释放 |
+
+---
+
+## 6. 错误响应说明
 
 所有业务错误使用统一信封：
 
@@ -319,9 +456,9 @@ Alice -- Bob
 
 ---
 
-## 6. 并发与重启一致性
+## 7. 并发与重启一致性
 
-### 6.1 为什么不会“先通过权限、后用旧资格提交”
+### 7.1 为什么不会“先通过权限、后用旧资格提交”
 
 项目修改不是先在事务外鉴权再更新，而是在同一个事务中：
 
@@ -341,7 +478,7 @@ Alice -- Bob
 
 历史查询使用 `BEGIN` 快照，鉴权查询和历史读取处于同一一致性快照中，避免读取路径出现类似 TOCTOU。
 
-### 6.2 多条图变化不会留下部分结果
+### 7.2 多条图变化不会留下部分结果
 
 每次建边/删边都在一个事务里同时完成：
 
@@ -358,7 +495,7 @@ Alice -- Bob
 
 因此不会出现图版本已增加但事件/边只写了一半的状态。
 
-### 6.3 用 graph version 做事后独立证明
+### 7.3 用 graph version 做事后独立证明
 
 每条项目历史记录保存 `graph_version`。验证脚本打开 SQLite 文件，按版本重建当时有效边：
 
@@ -392,7 +529,7 @@ PASS: restart, ownership, actor history, concurrency, and revocation checks
 
 其中 `final_active_edges: 1` 来自并发邀请测试创建的另一条边；被专门检查的 A-B 主测试边断言为 0。
 
-### 6.4 重启验证内容
+### 7.4 重启验证内容
 
 `verify_restart_concurrency.py` 会：
 
@@ -410,12 +547,14 @@ PASS: restart, ownership, actor history, concurrency, and revocation checks
 
 ---
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```text
 creator-link-backend/
 ├── app/
-│   ├── main.py          # FastAPI 路由、鉴权依赖、事务内授权
+│   ├── main.py          # FastAPI 路由、事务内授权、curation
+│   ├── issues.py        # 限量刊期：快照、渠道树、名额、邀请、领取
+│   ├── deps.py          # 共享的 Bearer 会话依赖
 │   ├── db.py            # SQLite schema、WAL/busy_timeout、事务上下文
 │   ├── schemas.py       # 请求模型；不接收 owner_id 更新
 │   ├── security.py      # PBKDF2 密码哈希、随机 token、SHA-256 token 存储
@@ -424,15 +563,18 @@ creator-link-backend/
 │   ├── wb_common.py
 │   ├── demo_two_sessions.py
 │   ├── demo_three_chain.py
+│   ├── demo_issues.py
 │   ├── verify_restart_concurrency.py
+│   ├── verify_issues_restart_concurrency.py
 │   └── run_all_checks.sh
 ├── tests/
-│   └── test_workbench.py
+│   ├── test_workbench.py
+│   └── test_issues.py
 ├── requirements.txt
 └── README.md
 ```
 
-## 8. 生产化备注
+## 9. 生产化备注
 
 这是满足本地可运行要求的简洁实现。若进一步上线，可在不改变核心事务模型的前提下补充：
 
