@@ -112,6 +112,53 @@ CREATE TABLE IF NOT EXISTS graph_events (
     actor_id INTEGER NOT NULL REFERENCES accounts(id),
     created_at REAL NOT NULL
 );
+
+-- One proposed replacement of [start, end) in the content of base_revision.
+-- Submitting a proposal never touches projects/project_revisions; only the
+-- owner's accept/withdraw decisions do, in the same transaction that records
+-- the resulting project revision.
+CREATE TABLE IF NOT EXISTS curation_proposals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    proposer_id INTEGER NOT NULL REFERENCES accounts(id),
+    base_revision INTEGER NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    original_text TEXT NOT NULL,
+    replacement TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'rejected', 'accepted', 'withdrawn')),
+    accepted_start INTEGER,
+    accepted_end INTEGER,
+    created_at REAL NOT NULL,
+    decided_at REAL,
+    decided_by INTEGER REFERENCES accounts(id),
+    accepted_revision INTEGER,
+    withdrawn_at REAL,
+    withdrawn_by INTEGER REFERENCES accounts(id),
+    withdrawn_revision INTEGER,
+    CHECK (start <= end),
+    CHECK (end >= 0 AND start >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_curations_project
+    ON curation_proposals(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_curations_proposer
+    ON curation_proposals(proposer_id, id);
+
+-- Exact span changed by a curation accept/withdraw.  The pre-existing PATCH
+-- endpoint replaces the whole content and records no row here; an actual
+-- content change through PATCH is therefore treated as a whole-document
+-- rewrite when carrying a proposal range forward.
+CREATE TABLE IF NOT EXISTS project_content_edits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    edit_start INTEGER NOT NULL,
+    edit_end INTEGER NOT NULL,
+    inserted_length INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(project_id, revision)
+);
 """
 
 

@@ -24,9 +24,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from .curation import map_range_through_contents, splice
 from .db import get_db, init_db, read_transaction, write_transaction
 from .errors import ApiError, error_body
-from .schemas import CredentialsIn, InvitationCreateIn, ProjectCreateIn, ProjectUpdateIn
+from .schemas import (
+    CredentialsIn,
+    CurationCreateIn,
+    InvitationCreateIn,
+    ProjectCreateIn,
+    ProjectUpdateIn,
+)
 from .security import (
     SESSION_TTL_SECONDS,
     hash_password,
@@ -989,6 +996,716 @@ def project_history(
             }
         )
     return {"project_id": project_id, "history": history}
+
+
+# ---------------------------------------------------------------------------
+# Curation review: collaborators propose, the owner decides
+# ---------------------------------------------------------------------------
+
+CURATION_APPROVAL_ACTIONS = ("accepted", "withdrawn")
+
+
+def curation_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "base_revision": row["base_revision"],
+        "start": row["start"],
+        "end": row["end"],
+        "original_text": row["original_text"],
+        "replacement": row["replacement"],
+        "operation": (
+            "insert"
+            if row["start"] == row["end"]
+            else "delete"
+            if row["replacement"] == ""
+            else "replace"
+        ),
+        "status": row["status"],
+        "proposer": {
+            "id": row["proposer_id"],
+            "username": row["proposer_username"],
+        },
+        "created_at": iso_from_ts(row["created_at"]),
+        "decided_by": (
+            {"id": row["decided_by"], "username": row["decided_by_username"]}
+            if row["decided_by"] is not None
+            else None
+        ),
+        "decided_at": iso_from_ts(row["decided_at"]),
+        "accepted_range": (
+            {"start": row["accepted_start"], "end": row["accepted_end"]}
+            if row["accepted_start"] is not None
+            else None
+        ),
+        "accepted_revision": row["accepted_revision"],
+        "withdrawn_by": (
+            {"id": row["withdrawn_by"], "username": row["withdrawn_by_username"]}
+            if row["withdrawn_by"] is not None
+            else None
+        ),
+        "withdrawn_at": iso_from_ts(row["withdrawn_at"]),
+        "withdrawn_revision": row["withdrawn_revision"],
+    }
+
+
+CURATION_SELECT = """
+SELECT c.*, proposer.username AS proposer_username,
+       decider.username AS decided_by_username,
+       withdrawer.username AS withdrawn_by_username
+  FROM curation_proposals c
+  JOIN accounts proposer ON proposer.id = c.proposer_id
+  LEFT JOIN accounts decider ON decider.id = c.decided_by
+  LEFT JOIN accounts withdrawer ON withdrawer.id = c.withdrawn_by
+"""
+
+
+def fetch_curation(conn: sqlite3.Connection, curation_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        CURATION_SELECT + " WHERE c.id = ?", (curation_id,)
+    ).fetchone()
+
+
+def curation_visible(
+    conn: sqlite3.Connection, viewer_id: int, project: sqlite3.Row, curation: sqlite3.Row
+) -> bool:
+    """Owner sees all of a project's proposals; others see only their own.
+
+    Bystanders with access to the project never see another collaborator's
+    proposal.  A proposer whose access has since been revoked cannot read the
+    item any more either; the item itself stays for the owner to decide.
+    """
+    if viewer_id == project["owner_id"]:
+        return True
+    if viewer_id != curation["proposer_id"]:
+        return False
+    return fetch_accessible_project(conn, viewer_id, project["id"]) is not None
+
+
+def project_content_at(
+    conn: sqlite3.Connection, project_id: int, revision: int
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT content FROM project_revisions
+         WHERE project_id = ? AND revision = ?
+        """,
+        (project_id, revision),
+    ).fetchone()
+    return None if row is None else row["content"]
+
+
+def map_range_to_current(
+    conn: sqlite3.Connection,
+    *,
+    project: sqlite3.Row,
+    origin_revision: int,
+    start: int,
+    end: int,
+) -> tuple[int, int] | None:
+    """Carry ``[start, end)`` from a content revision to the current content.
+
+    Returns ``None`` when a later revision conflicts: an exact edit touched the
+    range or an endpoint, or the pre-existing PATCH endpoint changed the
+    content at all (treated as a whole-document rewrite).
+    """
+    origin_content = project_content_at(conn, project["id"], origin_revision)
+    if origin_content is None:
+        return None
+    if start < 0 or end < start or end > len(origin_content):
+        return None
+
+    later = conn.execute(
+        """
+        SELECT r.revision, r.content, e.edit_start, e.edit_end, e.inserted_length
+          FROM project_revisions r
+          LEFT JOIN project_content_edits e
+                 ON e.project_id = r.project_id AND e.revision = r.revision
+         WHERE r.project_id = ? AND r.revision > ?
+         ORDER BY r.revision ASC
+        """,
+        (project["id"], origin_revision),
+    ).fetchall()
+
+    previous = origin_content
+    for row in later:
+        current = row["content"]
+        if current == previous:
+            previous = current  # title-only or identical re-save
+            continue
+        if row["edit_start"] is None:
+            # Content changed without a recorded exact edit (the direct PATCH
+            # API): whole-document rewrite, so it always conflicts.
+            return None
+        mapped = map_through_edit(
+            start,
+            end,
+            int(row["edit_start"]),
+            int(row["edit_end"]),
+            int(row["inserted_length"]),
+        )
+        if mapped is None:
+            return None
+        start, end = mapped
+        previous = current
+
+    if project["content"] != previous:
+        # Defensive: a content change not represented in history at all.
+        return None
+    return start, end
+
+
+def mapped_proposal_range(
+    conn: sqlite3.Connection, curation: sqlite3.Row, project: sqlite3.Row
+) -> tuple[int, int] | None:
+    """Map the proposal's base range to the project's current content."""
+    base_content = project_content_at(
+        conn, project["id"], curation["base_revision"]
+    )
+    if base_content is None:
+        return None
+    start, end = int(curation["start"]), int(curation["end"])
+    # A stale recorded original_text is itself an unsafe mismatch.
+    if base_content[start:end] != curation["original_text"]:
+        return None
+    return map_range_to_current(
+        conn,
+        project=project,
+        origin_revision=curation["base_revision"],
+        start=start,
+        end=end,
+    )
+
+
+def require_owner(project: sqlite3.Row, viewer_id: int) -> None:
+    if viewer_id != project["owner_id"]:
+        raise ApiError(
+            403,
+            "NOT_PROJECT_OWNER",
+            "Only the project owner can decide curation proposals.",
+            {"project_id": project["id"]},
+        )
+
+
+def insert_project_revision(
+    conn: sqlite3.Connection,
+    *,
+    project_id: int,
+    revision: int,
+    actor_id: int,
+    title: str,
+    content: str,
+    ts: float,
+    graph_version: int | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO project_revisions(
+            project_id, revision, action, actor_id, title, content,
+            graph_version, created_at
+        ) VALUES (?, ?, 'updated', ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            revision,
+            actor_id,
+            title,
+            content,
+            current_graph_version(conn) if graph_version is None else graph_version,
+            ts,
+        ),
+    )
+
+
+def record_content_edit(
+    conn: sqlite3.Connection,
+    *,
+    project_id: int,
+    revision: int,
+    edit_start: int,
+    edit_end: int,
+    inserted_length: int,
+    ts: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO project_content_edits(
+            project_id, revision, edit_start, edit_end, inserted_length, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (project_id, revision, edit_start, edit_end, inserted_length, ts),
+    )
+
+
+@app.post("/projects/{project_id}/curations", status_code=201)
+def submit_curation(
+    project_id: int,
+    body: CurationCreateIn,
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    viewer_id = account["id"]
+    with write_transaction(conn):
+        project = fetch_accessible_project(conn, viewer_id, project_id)
+        if project is None:
+            deny_if_project_inaccessible(conn, viewer_id, project_id)
+
+        base_content = project_content_at(conn, project_id, body.base_revision)
+        if base_content is None:
+            raise ApiError(
+                404,
+                "REVISION_NOT_FOUND",
+                "The referenced project revision does not exist.",
+                {"base_revision": body.base_revision},
+            )
+        if body.end > len(base_content):
+            raise ApiError(
+                422,
+                "RANGE_OUT_OF_BOUNDS",
+                "Range end exceeds the revision content length.",
+                {"base_revision": body.base_revision, "length": len(base_content)},
+            )
+        original = base_content[body.start : body.end]
+        if original == body.replacement:
+            raise ApiError(
+                422,
+                "NO_CHANGE",
+                "The replacement is identical to the targeted text.",
+            )
+
+        ts = now_ts()
+        cursor = conn.execute(
+            """
+            INSERT INTO curation_proposals(
+                project_id, proposer_id, base_revision, start, end,
+                original_text, replacement, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                project_id,
+                viewer_id,
+                body.base_revision,
+                body.start,
+                body.end,
+                original,
+                body.replacement,
+                ts,
+            ),
+        )
+        curation_id = cursor.lastrowid
+        row = fetch_curation(conn, curation_id)
+
+    return {"curation": curation_dict(row)}
+
+
+@app.get("/projects/{project_id}/curations")
+def list_curations(
+    project_id: int,
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    viewer_id = account["id"]
+    with read_transaction(conn):
+        project = fetch_accessible_project(conn, viewer_id, project_id)
+        if project is None:
+            deny_if_project_inaccessible(conn, viewer_id, project_id)
+
+        if viewer_id == project["owner_id"]:
+            rows = conn.execute(
+                CURATION_SELECT
+                + """
+                 WHERE c.project_id = ?
+                 ORDER BY c.id ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                CURATION_SELECT
+                + """
+                 WHERE c.project_id = ? AND c.proposer_id = ?
+                 ORDER BY c.id ASC
+                """,
+                (project_id, viewer_id),
+            ).fetchall()
+
+    return {
+        "project_id": project_id,
+        "viewer": "owner" if viewer_id == project["owner_id"] else "proposer",
+        "curations": [curation_dict(row) for row in rows],
+    }
+
+
+@app.get("/projects/{project_id}/curations/{curation_id}")
+def get_curation(
+    project_id: int,
+    curation_id: int,
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    viewer_id = account["id"]
+    with read_transaction(conn):
+        project = fetch_accessible_project(conn, viewer_id, project_id)
+        if project is None:
+            deny_if_project_inaccessible(conn, viewer_id, project_id)
+        curation = fetch_curation(conn, curation_id)
+        if curation is None or curation["project_id"] != project_id:
+            raise ApiError(404, "CURATION_NOT_FOUND", "Curation proposal was not found.")
+        if not curation_visible(conn, viewer_id, project, curation):
+            raise ApiError(
+                403,
+                "NOT_CURATION_PARTICIPANT",
+                "Only the project owner or this proposal's submitter can read it.",
+                {"project_id": project_id, "curation_id": curation_id},
+            )
+
+    return {"curation": curation_dict(curation)}
+
+
+def _decision_target(
+    conn: sqlite3.Connection,
+    *,
+    project: sqlite3.Row,
+    curation: sqlite3.Row,
+    action: str,
+) -> tuple[int, int]:
+    """Resolve the span a decision edits on the current content.
+
+    Accept starts from the proposal's base range.  Withdraw starts from the
+    span recorded when the proposal was accepted.  Both are carried through
+    later revisions and must not have been touched.
+    """
+    if action == "accepted":
+        mapped = mapped_proposal_range(conn, curation, project)
+        if mapped is not None:
+            start, end = mapped
+            if project["content"][start:end] != curation["original_text"]:
+                mapped = None
+        origin = curation["base_revision"]
+    else:
+        accepted_revision = curation["accepted_revision"]
+        if (
+            curation["accepted_start"] is None
+            or curation["accepted_end"] is None
+            or accepted_revision is None
+        ):
+            raise ApiError(
+                409,
+                "CURATION_NOT_ACCEPTED",
+                "This proposal has no accepted replacement to withdraw.",
+            )
+        mapped = map_range_to_current(
+            conn,
+            project=project,
+            origin_revision=accepted_revision,
+            start=int(curation["accepted_start"]),
+            end=int(curation["accepted_end"]),
+        )
+        if mapped is not None:
+            start, end = mapped
+            if project["content"][start:end] != curation["replacement"]:
+                mapped = None
+        origin = accepted_revision
+
+    if mapped is None:
+        raise ApiError(
+            409,
+            "CURATION_RANGE_CONFLICT",
+            "Later edits overlap the targeted span or one of its endpoints.",
+            {
+                "curation_id": curation["id"],
+                "origin_revision": origin,
+                "current_revision": project["revision"],
+            },
+        )
+    return mapped
+
+
+def _apply_decision(
+    conn: sqlite3.Connection,
+    *,
+    project: sqlite3.Row,
+    curation: sqlite3.Row,
+    viewer_id: int,
+    action: str,
+) -> sqlite3.Row:
+    """Shared accept/withdraw core.  Caller holds ``BEGIN IMMEDIATE``.
+
+    The decision either fully applies (proposal status + project content +
+    project revision + exact edit record) or raises before changing anything.
+    """
+    if action == "accepted":
+        if curation["status"] == "withdrawn":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_WITHDRAWN",
+                "A withdrawn proposal cannot be accepted again.",
+            )
+        if curation["status"] == "rejected":
+            raise ApiError(
+                409,
+                "CURATION_REJECTED",
+                "A rejected proposal cannot be accepted.",
+            )
+        if curation["status"] == "accepted":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_DECIDED",
+                "This proposal has already been accepted.",
+                {"accepted_revision": curation["accepted_revision"]},
+            )
+        new_text_piece = curation["replacement"]
+    else:  # withdrawn
+        if curation["status"] == "withdrawn":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_WITHDRAWN",
+                "This proposal has already been withdrawn.",
+                {"withdrawn_revision": curation["withdrawn_revision"]},
+            )
+        if curation["status"] != "accepted":
+            raise ApiError(
+                409,
+                "CURATION_NOT_ACCEPTED",
+                "Only an accepted proposal can be withdrawn.",
+                {"status": curation["status"]},
+            )
+        new_text_piece = curation["original_text"]
+
+    target_start, target_end = _decision_target(
+        conn, project=project, curation=curation, action=action
+    )
+
+    content = project["content"]
+    new_text = content[:target_start] + new_text_piece + content[target_end:]
+    ts = now_ts()
+    new_revision = int(project["revision"]) + 1
+    conn.execute(
+        """
+        UPDATE projects
+           SET content = ?, revision = ?, updated_at = ?
+         WHERE id = ?
+        """,
+        (new_text, new_revision, ts, project["id"]),
+    )
+    insert_project_revision(
+        conn,
+        project_id=project["id"],
+        revision=new_revision,
+        actor_id=viewer_id,
+        title=project["title"],
+        content=new_text,
+        ts=ts,
+    )
+    record_content_edit(
+        conn,
+        project_id=project["id"],
+        revision=new_revision,
+        edit_start=target_start,
+        edit_end=target_end,
+        inserted_length=len(new_text_piece),
+        ts=ts,
+    )
+    if action == "accepted":
+        conn.execute(
+            """
+            UPDATE curation_proposals
+               SET status = 'accepted', decided_at = ?, decided_by = ?,
+                   accepted_revision = ?, accepted_start = ?, accepted_end = ?
+             WHERE id = ?
+            """,
+            (
+                ts,
+                viewer_id,
+                new_revision,
+                target_start,
+                target_start + len(new_text_piece),
+                curation["id"],
+            ),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE curation_proposals
+               SET status = 'withdrawn', withdrawn_at = ?, withdrawn_by = ?,
+                   withdrawn_revision = ?
+             WHERE id = ?
+            """,
+            (ts, viewer_id, new_revision, curation["id"]),
+        )
+    return conn.execute(
+        """
+        SELECT p.*, a.username AS owner_username
+          FROM projects p JOIN accounts a ON a.id = p.owner_id
+         WHERE p.id = ?
+        """,
+        (project["id"],),
+    ).fetchone()
+
+
+def _decide(
+    *,
+    project_id: int,
+    curation_id: int,
+    action: str,
+    account: sqlite3.Row,
+    conn: sqlite3.Connection,
+    if_match: str | None,
+) -> dict[str, Any]:
+    """Owner-only decision.  Authorization, range check, edit and history
+    commit in one ``BEGIN IMMEDIATE`` transaction; any conflict changes
+    nothing."""
+    viewer_id = account["id"]
+    with write_transaction(conn):
+        project = conn.execute(
+            "SELECT * FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if project is None:
+            raise ApiError(404, "PROJECT_NOT_FOUND", "Project was not found.")
+        # Re-check dynamic access inside the transaction: a proposer who lost
+        # access must not decide, and the owner remains the owner.
+        if fetch_accessible_project(conn, viewer_id, project_id) is None:
+            raise ApiError(
+                403,
+                "PROJECT_ACCESS_DENIED",
+                "Current account is not connected to the project owner's component.",
+                {"project_id": project_id},
+            )
+        require_owner(project, viewer_id)
+
+        if if_match is not None:
+            try:
+                expected_revision = int(if_match.strip().strip('"'))
+            except ValueError as exc:
+                raise ApiError(
+                    422,
+                    "INVALID_IF_MATCH",
+                    "If-Match must be an integer revision.",
+                ) from exc
+            if expected_revision != project["revision"]:
+                raise ApiError(
+                    409,
+                    "REVISION_CONFLICT",
+                    "Project revision does not match If-Match.",
+                    {
+                        "expected_revision": expected_revision,
+                        "current_revision": project["revision"],
+                    },
+                )
+
+        curation = fetch_curation(conn, curation_id)
+        if curation is None or curation["project_id"] != project_id:
+            raise ApiError(404, "CURATION_NOT_FOUND", "Curation proposal was not found.")
+
+        row = _apply_decision(
+            conn,
+            project=project,
+            curation=curation,
+            viewer_id=viewer_id,
+            action=action,
+        )
+        updated_curation = fetch_curation(conn, curation_id)
+
+    return {
+        "project": project_dict(row, viewer_id),
+        "curation": curation_dict(updated_curation),
+    }
+
+
+@app.post("/projects/{project_id}/curations/{curation_id}/accept")
+def accept_curation(
+    project_id: int,
+    curation_id: int,
+    if_match: str | None = Header(default=None),
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    return _decide(
+        project_id=project_id,
+        curation_id=curation_id,
+        action="accepted",
+        account=account,
+        conn=conn,
+        if_match=if_match,
+    )
+
+
+@app.post("/projects/{project_id}/curations/{curation_id}/reject")
+def reject_curation(
+    project_id: int,
+    curation_id: int,
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    viewer_id = account["id"]
+    with write_transaction(conn):
+        project = conn.execute(
+            "SELECT * FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if project is None:
+            raise ApiError(404, "PROJECT_NOT_FOUND", "Project was not found.")
+        if fetch_accessible_project(conn, viewer_id, project_id) is None:
+            raise ApiError(
+                403,
+                "PROJECT_ACCESS_DENIED",
+                "Current account is not connected to the project owner's component.",
+                {"project_id": project_id},
+            )
+        require_owner(project, viewer_id)
+
+        curation = fetch_curation(conn, curation_id)
+        if curation is None or curation["project_id"] != project_id:
+            raise ApiError(404, "CURATION_NOT_FOUND", "Curation proposal was not found.")
+        if curation["status"] == "accepted":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_DECIDED",
+                "An accepted proposal must be withdrawn, not rejected.",
+                {"accepted_revision": curation["accepted_revision"]},
+            )
+        if curation["status"] == "withdrawn":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_WITHDRAWN",
+                "A withdrawn proposal cannot be rejected.",
+            )
+        if curation["status"] == "rejected":
+            raise ApiError(
+                409,
+                "CURATION_ALREADY_DECIDED",
+                "This proposal has already been rejected.",
+            )
+
+        ts = now_ts()
+        conn.execute(
+            """
+            UPDATE curation_proposals
+               SET status = 'rejected', decided_at = ?, decided_by = ?
+             WHERE id = ?
+            """,
+            (ts, viewer_id, curation["id"]),
+        )
+        updated = fetch_curation(conn, curation_id)
+
+    return {"curation": curation_dict(updated)}
+
+
+@app.post("/projects/{project_id}/curations/{curation_id}/withdraw")
+def withdraw_curation(
+    project_id: int,
+    curation_id: int,
+    if_match: str | None = Header(default=None),
+    account: sqlite3.Row = Depends(get_current_account),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    return _decide(
+        project_id=project_id,
+        curation_id=curation_id,
+        action="withdrawn",
+        account=account,
+        conn=conn,
+        if_match=if_match,
+    )
 
 
 # Initialize on import as well as lifespan so TestClient and direct ASGI

@@ -21,6 +21,26 @@ class ProjectCreateIn(BaseModel):
     content: str = Field(default="", max_length=100_000)
 
 
+class CurationCreateIn(BaseModel):
+    """One proposed replacement of a half-open code-point range in a revision.
+
+    ``[start, end)`` refers to the content of ``base_revision`` (an existing
+    project revision number).  An empty range is an insertion and an empty
+    replacement string is a deletion.  Submitting never edits the project.
+    """
+
+    base_revision: int = Field(ge=1)
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    replacement: str = Field(max_length=100_000)
+
+    @model_validator(mode="after")
+    def require_ordered_range(self) -> "CurationCreateIn":
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        return self
+
+
 class ProjectUpdateIn(BaseModel):
     # Unknown fields, including an attempted owner_id, are ignored. Ownership
     # is only ever read from projects.owner_id and is never updated.
